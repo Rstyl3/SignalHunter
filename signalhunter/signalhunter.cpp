@@ -42,18 +42,26 @@ constexpr uint32_t kUiIntervalMs    = 40;
 
 // Detection table
 constexpr int      kMaxDetections   = 64;
-constexpr uint32_t kStaleMs         = 4000;   // drop entries not seen in this long
+// Stale window: must comfortably exceed the worst-case re-detection latency
+// for a STA caught only during the 200 ms-per-channel promisc dwell (every
+// 5 s). 4 s was too aggressive — STA cameras like the Tapo C210 frequently
+// missed re-detection between bursts and aged out before the 3 s list
+// repaint, making them invisible. 20 s = 4 burst opportunities.
+constexpr uint32_t kStaleMs         = 20000;
 constexpr uint32_t kLockedStaleMs   = 30000;  // locked target gets a longer grace period
 
-// RSSI band thresholds (dBm). Tightened so green-steady only triggers at
-// genuine close range (~1-3 m indoors). RSSI vs distance is NOT linear and
-// varies with transmitter power, so these may need adjustment per target —
-// a cheap low-power camera at 1 m may read what a loud phone reads at 5 m.
-constexpr int kBandFarMin       = -82;  // weaker than this -> OUT OF RANGE
-constexpr int kBandNearMin      = -70;
-constexpr int kBandCloseMin     = -58;
-constexpr int kBandVeryCloseMin = -45;  // lime steady starts here (~1.5-3 m)
-constexpr int kBandHotMin       = -40;  // emerald steady (~1 m or closer)
+// RSSI band thresholds (dBm). Calibrated for *low-power* targets like Google
+// Nest / Tapo / Wyze cameras, which often only register −55 to −65 dBm even
+// at contact distance because of internal shielding + FCC-limited TX power.
+// Phones / laptops will trigger HOT from further away — that's expected for
+// a hunting tool (false positives easier to dismiss than false negatives).
+// Even 10 dB spacing per band so the LED progression feels linear as you walk.
+constexpr int kBandFarMin       = -85;  // weaker than this -> OUT OF RANGE
+constexpr int kBandNearMin      = -78;  // crimson blink
+constexpr int kBandCloseMin     = -70;  // amber blink
+constexpr int kBandVeryCloseMin = -60;  // lime steady
+constexpr int kBandHotMin       = -52;  // emerald steady (~contact distance
+                                        // for low-TX-power cameras)
 
 // Hysteresis: don't change bands unless RSSI crosses boundary by this much,
 // in the direction it's already heading. Prevents flicker at band edges.
@@ -68,15 +76,26 @@ constexpr int kRssiEmaNum = 1;
 constexpr int kRssiEmaDen = 3;  // alpha = 0.33
 
 // Scan timing
-constexpr uint32_t kWifiScanPeriodMs = 3500;  // active AP scan every N ms
+constexpr uint32_t kWifiScanPeriodMs = 5000;  // active AP scan + promisc every N ms
 constexpr uint32_t kWifiScanTimeMs   = 1500;  // scan duration (covers all 2.4G chans)
 constexpr uint32_t kBleScanWindowMs  = 250;   // chunk size for BLE scan loop
 
-// Button timing
+// Promiscuous-mode station capture — runs after every AP scan. Each cycle
+// hops through 2.4 GHz channels listening for 802.11 management + data frames
+// to harvest station MACs (cameras like the Tapo C210 that connect to an
+// existing AP rather than hosting their own).
+constexpr uint8_t  kPromiscFirstChan   = 1;
+constexpr uint8_t  kPromiscLastChan    = 13;   // 14 is JP-only, skip
+constexpr uint32_t kPromiscDwellMs     = 200;  // per-channel listen time
+                                               // (13 ch * 200ms = ~2.6s sweep)
+
+// Button timing — widened LONG window so a comfortable "hold to lock" press
+// (typically 1-2.5 s in the wild) doesn't slip into EXTRA_LONG territory.
+// EXTRA_LONG (mode swap) now requires a deliberate 3.5+ s hold.
 constexpr uint32_t kShortPressMaxMs    = 600;
 constexpr uint32_t kLongPressMinMs     = 600;
-constexpr uint32_t kLongPressMaxMs     = 2000;
-constexpr uint32_t kExtraLongPressMs   = 2000;
+constexpr uint32_t kLongPressMaxMs     = 3500;
+constexpr uint32_t kExtraLongPressMs   = 3500;
 
 // LED — 5-color rainbow gradient with rate-of-blink ramping into a steady
 // "found it" state. Richer RGB tones than pure primaries so the LED doesn't
@@ -109,8 +128,9 @@ constexpr uint32_t kBlinkCloseMs = 143;   // ~3.5 Hz
 // ============================================================================
 
 enum Radio : uint8_t {
-    RADIO_WIFI_AP = 0,
-    RADIO_BLE     = 1,
+    RADIO_WIFI_AP  = 0,
+    RADIO_BLE      = 1,
+    RADIO_WIFI_STA = 2,   // station — seen via promiscuous-mode frame capture
 };
 
 enum Band : uint8_t {
@@ -162,6 +182,21 @@ volatile UiMode g_ui_mode = UI_HUNT;
 // whichever device occupies that row at the moment of the button event.
 int g_list_highlight = 0;
 
+// Cached MAC display order for the List view, so the list stays stable for a
+// few seconds at a time instead of reshuffling every UI tick as RSSI jitters.
+// Refreshed every kListReorderPeriodMs; new devices arriving between refreshes
+// are appended at the bottom so they don't kick rows around.
+// Full list refresh cadence — same period for order re-sort AND row repaint
+// so the entire list view changes in one beat every 3 seconds, and is
+// completely static between beats. Button presses force an immediate update.
+constexpr uint32_t kListReorderPeriodMs = 3000;
+uint8_t  g_list_order_macs[kMaxDetections][6];
+int      g_list_order_count   = 0;
+uint32_t g_list_order_last_ms = 0;
+
+constexpr uint32_t kListRenderPeriodMs  = 3000;
+uint32_t g_list_last_render_ms = 0;
+
 // LED
 Adafruit_NeoPixel g_rgb(kRgbCount, kRgbPin, kNeoPixelType);
 
@@ -202,6 +237,17 @@ inline void setLedColor(const RgbColor& c, uint8_t brightnessPercent) {
     const uint8_t b = static_cast<uint8_t>((static_cast<uint16_t>(c.b) * scale) / 255);
     g_rgb.setPixelColor(0, g_rgb.Color(r, g, b));
     g_rgb.show();
+}
+
+// Icon mapping per radio type. STA (client on a Wi-Fi network — including
+// cameras like the Tapo C210) uses HOME so it's visually distinct from AP
+// (broadcasting a network), which keeps the WIFI fan.
+inline const char* radioIcon(uint8_t radio) {
+    switch (radio) {
+        case RADIO_BLE:      return LV_SYMBOL_BLUETOOTH;
+        case RADIO_WIFI_STA: return LV_SYMBOL_HOME;
+        default:             return LV_SYMBOL_WIFI;   // RADIO_WIFI_AP
+    }
 }
 
 // ============================================================================
@@ -249,6 +295,17 @@ void noteDetection(const uint8_t mac[6], int rssi, const char* name,
         d.vendor = cameraOuiVendor(mac);
         d.name[0] = '\0';
         d.name_hit = nullptr;
+        // One-time log per new device so the user can see what's in range
+        // and (if needed) add a missing OUI to CameraOUI.h.
+        const char* rname =
+            (radio == RADIO_BLE)      ? "BLE" :
+            (radio == RADIO_WIFI_STA) ? "STA" : "AP";
+        Serial.printf("[NEW] %s %02X:%02X:%02X:%02X:%02X:%02X "
+                      "rssi=%d ch=%u vendor=%s\n",
+                      rname,
+                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                      rssi, channel,
+                      d.vendor ? d.vendor : "(unknown)");
     }
     d.rssi = static_cast<int8_t>(rssi);
     // EMA: smoothed = smoothed + alpha*(rssi - smoothed)
@@ -285,22 +342,34 @@ int snapshotFresh(Detection* out) {
         out[n++] = g_detections[i];
     }
     portEXIT_CRITICAL(&g_mux);
-    // Sort: flagged (vendor or name_hit) first, then by rssi_smoothed desc.
+    // Sort priority (highest → lowest):
+    //   1. Flagged (camera-vendor / name match) before unflagged.
+    //   2. Real hardware MAC before locally-administered (privacy-rotated)
+    //      MACs — cameras use real MACs, phones rotate fake ones to thwart
+    //      tracking, so the rotated ones are noise for our use case.
+    //   3. Stronger rssi_smoothed (descending).
     // Simple insertion sort — at most 64 entries.
     auto flagged = [](const Detection& d) {
         return (d.vendor != nullptr) || (d.name_hit != nullptr);
     };
+    auto laa = [](const Detection& d) {
+        // bit 1 of the first byte = locally-administered (privacy MAC)
+        return (d.mac[0] & 0x02) != 0;
+    };
+    auto less = [&](const Detection& a, const Detection& b) {
+        // returns true if a sorts before b
+        const bool af = flagged(a), bf = flagged(b);
+        if (af != bf) return af;             // flagged wins
+        const bool al = laa(a), bl = laa(b);
+        if (al != bl) return !al;            // hardware MAC wins over LAA
+        return a.rssi_smoothed > b.rssi_smoothed;
+    };
     for (int i = 1; i < n; i++) {
         Detection key = out[i];
         int j = i - 1;
-        while (j >= 0) {
-            const bool kf = flagged(key);
-            const bool jf = flagged(out[j]);
-            if (kf != jf) {
-                if (kf && !jf) { out[j + 1] = out[j]; j--; } else break;
-            } else if (key.rssi_smoothed > out[j].rssi_smoothed) {
-                out[j + 1] = out[j]; j--;
-            } else break;
+        while (j >= 0 && less(key, out[j])) {
+            out[j + 1] = out[j];
+            j--;
         }
         out[j + 1] = key;
     }
@@ -313,6 +382,44 @@ int findInSnapshot(const Detection* snap, int n, const uint8_t mac[6]) {
         if (memcmp(snap[i].mac, mac, 6) == 0) return i;
     }
     return -1;
+}
+
+// Re-shuffles `snap` in place so it matches the cached display order — rows
+// for known MACs come first (in their cached positions), and any new devices
+// that weren't in the cache get appended at the end. The cache itself is
+// refreshed from the current sort every kListReorderPeriodMs so the list
+// eventually re-prioritises by RSSI without churning every frame.
+void stabilizeListOrder(Detection* snap, int n) {
+    const uint32_t now = millis();
+    if (g_list_order_count == 0 ||
+        (now - g_list_order_last_ms) >= kListReorderPeriodMs) {
+        g_list_order_count = n;
+        for (int i = 0; i < n; i++) {
+            memcpy(g_list_order_macs[i], snap[i].mac, 6);
+        }
+        g_list_order_last_ms = now;
+        return;  // current sort becomes the new cache
+    }
+
+    Detection out[kMaxDetections];
+    bool used[kMaxDetections] = {false};
+    int out_n = 0;
+    // 1) Cached entries in cached order.
+    for (int i = 0; i < g_list_order_count && out_n < kMaxDetections; i++) {
+        for (int j = 0; j < n; j++) {
+            if (used[j]) continue;
+            if (memcmp(snap[j].mac, g_list_order_macs[i], 6) == 0) {
+                out[out_n++] = snap[j];
+                used[j] = true;
+                break;
+            }
+        }
+    }
+    // 2) Any new devices that weren't in the cache, appended in fresh order.
+    for (int j = 0; j < n && out_n < kMaxDetections; j++) {
+        if (!used[j]) out[out_n++] = snap[j];
+    }
+    memcpy(snap, out, sizeof(Detection) * out_n);
 }
 
 // ============================================================================
@@ -395,16 +502,23 @@ uint32_t bandLcdColor(Band b) {
 
 // Map RSSI [-100, -30] -> [0, 100] for the bar widget.
 int rssiBarPercent(int rssi) {
-    int v = rssi + 100;        // -100 -> 0, -30 -> 70
+    // Bar scale tuned for low-TX-power IP cameras (Nest, Tapo, Wyze, …).
+    // -85 dBm = 0%, -55 dBm = 100%. Anything stronger clamps to 100% so
+    // a phone at point-blank doesn't pin the bar at 200% (visually same
+    // as 100%, but the math has to clamp somewhere).
+    int v = rssi + 85;          // -85 -> 0
     if (v < 0) v = 0;
-    if (v > 70) v = 70;
-    return (v * 100) / 70;
+    if (v > 30) v = 30;          // -55 -> 30 -> 100%
+    return (v * 100) / 30;
 }
 
 // ============================================================================
-// WiFi scanner — periodic active scan for APs (covers cameras hosting their own
-// AP, which is the most common spy-cam mode). Promiscuous-mode station capture
-// is out of scope for v1 to keep BLE+WiFi coexistence well-behaved.
+// WiFi scanner — two complementary modes:
+//   1. Periodic active AP scan (catches cameras hosting their own AP).
+//   2. Promiscuous-mode frame capture w/ channel hop (catches cameras that
+//      join an existing network as a station, e.g. Tapo C210).
+// BLE scanning is paused around each WiFi cycle to keep the shared 2.4 GHz
+// radio happy.
 // ============================================================================
 
 void runWifiScanOnce() {
@@ -429,6 +543,94 @@ void runWifiScanOnce() {
                       static_cast<uint8_t>(chan));
     }
     WiFi.scanDelete();
+}
+
+// Tracks which channel the promisc burst is currently dwelling on so the
+// callback can tag each captured frame with the channel it was heard on.
+volatile uint8_t  g_promisc_channel = 1;
+
+// Diagnostics — counts frames seen this burst so we can confirm in serial
+// that promiscuous capture is actually firing.
+volatile uint32_t g_promisc_frames_total = 0;
+volatile uint32_t g_promisc_frames_burst = 0;
+
+// 802.11 promiscuous-mode RX callback. Runs in the WiFi-RX task; keep it
+// short. Pulls out the source MAC (Address 2) and any SSID from probe
+// requests, pushes a RADIO_WIFI_STA detection.
+void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!buf) return;
+    if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+
+    const wifi_promiscuous_pkt_t* pkt =
+        static_cast<const wifi_promiscuous_pkt_t*>(buf);
+    const int len = pkt->rx_ctrl.sig_len;
+    if (len < 24) return;  // shorter than an 802.11 header
+
+    const int rssi = pkt->rx_ctrl.rssi;
+    const uint8_t* frame = pkt->payload;
+
+    // Frame Control byte 0: bits 2-3 = type, bits 4-7 = subtype.
+    const uint8_t fc0 = frame[0];
+    const uint8_t ftype = (fc0 >> 2) & 0x3;
+    const uint8_t fsubtype = (fc0 >> 4) & 0xF;
+
+    // Skip beacons (subtype 8) — those come from APs and are already covered
+    // by the active AP scan; they'd flood the detection table here.
+    if (ftype == 0 && fsubtype == 8) return;
+
+    // C++20 deprecated ++ on volatile — use explicit add.
+    g_promisc_frames_total = g_promisc_frames_total + 1;
+    g_promisc_frames_burst = g_promisc_frames_burst + 1;
+
+    // Address 2 = source MAC (the station for probes / outgoing data).
+    const uint8_t* src = frame + 10;
+    if (src[0] & 0x01) return;  // skip multicast / broadcast sources
+
+    // Probe-request: try to pull the requested SSID for nicer display.
+    char ssid[33] = {0};
+    if (ftype == 0 && fsubtype == 4 && len > 26 && frame[24] == 0x00) {
+        const int ssid_len = frame[25];
+        if (ssid_len > 0 && ssid_len <= 32 && len >= 26 + ssid_len) {
+            memcpy(ssid, frame + 26, ssid_len);
+            ssid[ssid_len] = '\0';
+        }
+    }
+
+    noteDetection(src, rssi, ssid[0] ? ssid : nullptr,
+                  RADIO_WIFI_STA, g_promisc_channel);
+}
+
+// One sweep of all 2.4 GHz channels in promiscuous mode. Called from
+// scannerTask after the AP scan, with BLE paused.
+void runPromiscBurst() {
+    static const wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
+                       WIFI_PROMIS_FILTER_MASK_DATA,
+    };
+    g_promisc_frames_burst = 0;
+
+    esp_err_t err = esp_wifi_set_promiscuous_filter(&filter);
+    if (err != ESP_OK) Serial.printf("[PROMISC] filter set err=%d\n", err);
+    err = esp_wifi_set_promiscuous_rx_cb(&promiscCb);
+    if (err != ESP_OK) Serial.printf("[PROMISC] cb set err=%d\n", err);
+    err = esp_wifi_set_promiscuous(true);
+    if (err != ESP_OK) {
+        Serial.printf("[PROMISC] enable FAILED err=%d (promisc unavailable?)\n",
+                      err);
+        return;  // bail — no point hopping if we're not actually listening
+    }
+
+    for (uint8_t ch = kPromiscFirstChan; ch <= kPromiscLastChan; ch++) {
+        g_promisc_channel = ch;
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+        vTaskDelay(pdMS_TO_TICKS(kPromiscDwellMs));
+    }
+
+    esp_wifi_set_promiscuous(false);
+
+    Serial.printf("[PROMISC] burst: %lu frames captured (total=%lu)\n",
+                  static_cast<unsigned long>(g_promisc_frames_burst),
+                  static_cast<unsigned long>(g_promisc_frames_total));
 }
 
 // ============================================================================
@@ -530,10 +732,19 @@ void scannerTask(void* /*arg*/) {
     for (;;) {
         const uint32_t now = millis();
 
-        // Periodic WiFi scan — blocks briefly, then we resume BLE.
         if (now - last_wifi_scan_ms >= kWifiScanPeriodMs) {
             last_wifi_scan_ms = now;
-            runWifiScanOnce();
+
+            // Hand the 2.4 GHz radio entirely to WiFi for this cycle —
+            // BLE and WiFi-promisc can't coexist while we hop channels.
+#if SH_USE_NIMBLE
+            NimBLEDevice::getScan()->stop();
+#else
+            BLEDevice::getScan()->stop();
+#endif
+
+            runWifiScanOnce();      // AP scan (~1.5 s)
+            runPromiscBurst();      // station capture across 13 channels (~1 s)
         }
 
         // BLE scan chunk — non-blocking-ish (returns after ~chunk).
@@ -711,7 +922,10 @@ void buildHuntScreen() {
     g_hunt_meta_label = makeLabel(g_hunt_screen, "",
                                   lv_color_hex(0x8BE9FD),
                                   &lv_font_montserrat_14);
-    lv_obj_align(g_hunt_meta_label, LV_ALIGN_TOP_MID, 0, 254);
+    // Anchor to the screen's bottom edge instead of measuring from the top —
+    // gives the bar/percentage panel above it room to breathe and keeps the
+    // freshness indicator out of the way as a footer.
+    lv_obj_align(g_hunt_meta_label, LV_ALIGN_BOTTOM_MID, 0, -6);
     lv_obj_set_style_text_align(g_hunt_meta_label, LV_TEXT_ALIGN_CENTER, 0);
 }
 
@@ -767,56 +981,73 @@ void buildListScreen() {
 // updates whichever screen is active + LED.
 // ============================================================================
 
+// Snapshot of g_lock_mac from the previous tick — used to detect when the
+// lock actually changes value (vs. just staying put) for debug logging.
+uint8_t g_prev_lock_mac[6] = {0};
+bool    g_prev_have_lock   = false;
+
+void logLockChangeIfAny() {
+    if (g_have_lock != g_prev_have_lock ||
+        (g_have_lock && memcmp(g_lock_mac, g_prev_lock_mac, 6) != 0)) {
+        if (g_have_lock) {
+            Serial.printf("[LOCK] -> %02X:%02X:%02X:%02X:%02X:%02X\n",
+                          g_lock_mac[0], g_lock_mac[1], g_lock_mac[2],
+                          g_lock_mac[3], g_lock_mac[4], g_lock_mac[5]);
+        } else {
+            Serial.printf("[LOCK] cleared\n");
+        }
+        memcpy(g_prev_lock_mac, g_lock_mac, 6);
+        g_prev_have_lock = g_have_lock;
+    }
+}
+
 void handleButton(const Detection* snap, int n) {
     const ButtonEvent ev = g_btn_event;
     if (ev == BTN_NONE) return;
     g_btn_event = BTN_NONE;
 
+    static const char* kEvName[] = {"NONE", "SHORT", "DOUBLE", "LONG", "EXTRA_LONG"};
+    Serial.printf("[BTN] %s in %s mode\n",
+                  (ev <= BTN_EXTRA_LONG) ? kEvName[ev] : "?",
+                  (g_ui_mode == UI_HUNT) ? "HUNT" : "LIST");
+
     if (g_ui_mode == UI_HUNT) {
-        if (ev == BTN_SHORT || ev == BTN_DOUBLE) {
-            // Cycle target: SHORT = next (down); DOUBLE = previous (up).
-            // snap order is flagged-first, rssi-desc.
-            if (n == 0) return;
-            const int dir = (ev == BTN_DOUBLE) ? -1 : +1;
-            if (!g_have_lock) {
-                const int start = (dir > 0) ? 0 : (n - 1);
-                memcpy(g_lock_mac, snap[start].mac, 6);
-                g_lock_radio = snap[start].radio;
-                g_have_lock = true;
-            } else {
-                int idx = findInSnapshot(snap, n, g_lock_mac);
-                if (idx < 0) idx = 0;
-                idx = (idx + dir + n) % n;
-                memcpy(g_lock_mac, snap[idx].mac, 6);
-                g_lock_radio = snap[idx].radio;
-                g_have_lock = true;
-            }
-        } else if (ev == BTN_LONG) {
-            g_have_lock = false;
-        } else if (ev == BTN_EXTRA_LONG) {
+        // While hunting, the lock is sticky — short / double presses do
+        // nothing so you can't accidentally swap targets while moving the
+        // device around. The only way out is to hold the button (LONG or
+        // EXTRA_LONG) to go back to the List and pick something else.
+        if (ev == BTN_LONG || ev == BTN_EXTRA_LONG) {
             g_ui_mode = UI_LIST;
             g_list_highlight = 0;
             lv_scr_load(g_list_screen);
         }
     } else {  // UI_LIST
+        // Any button event in List mode forces an immediate re-render so the
+        // user gets instant visual feedback instead of waiting for the next
+        // throttled tick.
+        g_list_last_render_ms = 0;
         if (ev == BTN_SHORT) {
-            if (n == 0) return;
-            g_list_highlight = (g_list_highlight + 1) % n;
+            const int total = g_list_order_count;
+            if (total == 0) return;
+            g_list_highlight = (g_list_highlight + 1) % total;
         } else if (ev == BTN_DOUBLE) {
-            if (n == 0) return;
-            g_list_highlight = (g_list_highlight - 1 + n) % n;
-        } else if (ev == BTN_LONG) {
-            if (n == 0) return;
-            // Clamp in case the list shrank under us.
+            const int total = g_list_order_count;
+            if (total == 0) return;
+            g_list_highlight = (g_list_highlight - 1 + total) % total;
+        } else if (ev == BTN_LONG || ev == BTN_EXTRA_LONG) {
+            // Lock the highlighted row and jump to Hunt. Either hold gesture
+            // counts so length doesn't matter — saves the user from holding
+            // "too long" and getting unexpected behavior.
+            const int total = g_list_order_count;
+            if (total == 0) return;
             int idx = g_list_highlight;
-            if (idx >= n) idx = n - 1;
+            if (idx >= total) idx = total - 1;
             if (idx < 0) idx = 0;
-            memcpy(g_lock_mac, snap[idx].mac, 6);
-            g_lock_radio = snap[idx].radio;
+            const uint8_t* mac = g_list_order_macs[idx];
+            const int j = findInSnapshot(snap, n, mac);
+            memcpy(g_lock_mac, mac, 6);
+            g_lock_radio = (j >= 0) ? snap[j].radio : RADIO_BLE;
             g_have_lock = true;
-            g_ui_mode = UI_HUNT;
-            lv_scr_load(g_hunt_screen);
-        } else if (ev == BTN_EXTRA_LONG) {
             g_ui_mode = UI_HUNT;
             lv_scr_load(g_hunt_screen);
         }
@@ -879,10 +1110,7 @@ void renderHunt(const Detection* active, int total_count) {
     } else {
         char tail[16];
         formatMacTail(active->mac, tail, sizeof(tail));
-        snprintf(buf, sizeof(buf), "%s %s",
-                 (active->radio == RADIO_BLE) ? LV_SYMBOL_BLUETOOTH
-                                              : LV_SYMBOL_WIFI,
-                 tail);
+        snprintf(buf, sizeof(buf), "%s %s", radioIcon(active->radio), tail);
     }
     lv_label_set_text(g_hunt_target_label, buf);
 
@@ -890,7 +1118,7 @@ void renderHunt(const Detection* active, int total_count) {
     const char* vendor_tag = active->vendor ? active->vendor :
                              (active->name_hit ? active->name_hit : "");
     if (vendor_tag[0]) {
-        snprintf(buf, sizeof(buf), "[CAM? %s]", vendor_tag);
+        snprintf(buf, sizeof(buf), LV_SYMBOL_EYE_OPEN " [CAM? %s]", vendor_tag);
         lv_label_set_text(g_hunt_vendor_label, buf);
         lv_obj_set_style_text_color(g_hunt_vendor_label,
                                     lv_color_hex(0xFFD000), 0);
@@ -919,68 +1147,112 @@ void renderHunt(const Detection* active, int total_count) {
                               LV_PART_INDICATOR);
 
     const uint32_t age = millis() - active->last_seen_ms;
+    // Two-line meta footer so each part has breathing room on the 172 px
+    // wide LCD: radio info on top, freshness on bottom. Icon already encodes
+    // radio mode (HOME = STA, WIFI fan = AP, BT = BLE) so we don't repeat it.
     if (active->radio == RADIO_BLE) {
-        snprintf(buf, sizeof(buf), LV_SYMBOL_BLUETOOTH " · %lums ago",
+        snprintf(buf, sizeof(buf), "%s\n%lums ago",
+                 radioIcon(active->radio),
                  static_cast<unsigned long>(age));
     } else {
-        snprintf(buf, sizeof(buf), LV_SYMBOL_WIFI " ch%u · %lums ago",
-                 active->channel, static_cast<unsigned long>(age));
+        snprintf(buf, sizeof(buf), "%s ch%u\n%lums ago",
+                 radioIcon(active->radio), active->channel,
+                 static_cast<unsigned long>(age));
     }
     lv_label_set_text(g_hunt_meta_label, buf);
 }
 
+// Refresh the cached list MAC order. Every kListReorderPeriodMs we re-sort
+// from scratch; between refreshes we drop rows whose device is gone and
+// append brand-new MACs at the bottom so the visible list stays still for
+// the user to read.
+void refreshListOrder(const Detection* snap, int n, uint32_t now) {
+    // Every kListReorderPeriodMs (3 s), capture a fresh sorted snapshot.
+    // Between captures, the list is completely frozen — same devices, same
+    // order, no additions, no removals. The user gets a stable 3-second
+    // window to read each beat without rows sliding around mid-scroll.
+    if (g_list_order_last_ms != 0 &&
+        (now - g_list_order_last_ms) < kListReorderPeriodMs) {
+        return;
+    }
+
+    g_list_order_count = n;
+    for (int i = 0; i < n; i++) {
+        memcpy(g_list_order_macs[i], snap[i].mac, 6);
+    }
+    g_list_order_last_ms = now;
+}
+
 void renderList(const Detection* snap, int n) {
-    char buf[48];
-    snprintf(buf, sizeof(buf), "Detections (%d)", n);
+    char buf[64];
+
+    refreshListOrder(snap, n, millis());
+    const int total = g_list_order_count;
+
+    // Count flagged for the title's eye-icon counter.
+    int cam_count = 0;
+    for (int i = 0; i < total; i++) {
+        const int j = findInSnapshot(snap, n, g_list_order_macs[i]);
+        if (j >= 0 && (snap[j].vendor || snap[j].name_hit)) cam_count++;
+    }
+    snprintf(buf, sizeof(buf), "Detections %d  " LV_SYMBOL_EYE_OPEN " %d",
+             total, cam_count);
     lv_label_set_text(g_list_title, buf);
 
-    // Highlight is a fixed row index. Clamp for display if the list shrank
-    // below the chosen row, but leave the stored value alone so the user's
-    // intent reappears once the list grows back.
+    // Clamp highlight row to current list size for display.
     int highlight_idx = g_list_highlight;
-    if (n == 0)                       highlight_idx = 0;
-    else if (highlight_idx >= n)      highlight_idx = n - 1;
+    if (total == 0)                   highlight_idx = 0;
+    else if (highlight_idx >= total)  highlight_idx = total - 1;
     else if (highlight_idx < 0)       highlight_idx = 0;
 
-    // Scroll so the highlighted row is always visible.
+    // Scroll so the highlighted row is visible.
     int scroll = 0;
     if (highlight_idx >= kListVisibleRows) {
         scroll = highlight_idx - kListVisibleRows + 1;
     }
-    if (scroll > n - kListVisibleRows) scroll = n - kListVisibleRows;
+    if (scroll > total - kListVisibleRows) scroll = total - kListVisibleRows;
     if (scroll < 0) scroll = 0;
 
     for (int row = 0; row < kListVisibleRows; row++) {
-        const int idx = row + scroll;
-        const bool highlighted = (idx == highlight_idx);
-        if (idx >= n) {
+        const int order_idx = row + scroll;
+        const bool highlighted = (order_idx == highlight_idx);
+        if (order_idx >= total) {
             lv_label_set_text(g_list_row_labels[row], "");
             lv_bar_set_value(g_list_row_bars[row], 0, LV_ANIM_OFF);
             lv_obj_set_style_bg_color(g_list_rows[row],
                                       lv_color_hex(0x0E2440), 0);
             continue;
         }
-        const Detection& d = snap[idx];
+        const int j = findInSnapshot(snap, n, g_list_order_macs[order_idx]);
         char tail[16];
-        formatMacTail(d.mac, tail, sizeof(tail));
-        // LVGL built-in glyphs from the Montserrat symbol set — render as the
-        // WiFi-arc and Bluetooth-runes icons via the same font as the text.
-        const char* type = (d.radio == RADIO_BLE) ? LV_SYMBOL_BLUETOOTH
-                                                  : LV_SYMBOL_WIFI;
-        const char flag = (d.vendor || d.name_hit) ? '*' : ' ';
+        formatMacTail(g_list_order_macs[order_idx], tail, sizeof(tail));
+        if (j < 0) {
+            // Device dropped between reorders — show greyed placeholder.
+            snprintf(buf, sizeof(buf), " %s --", tail);
+            lv_label_set_text(g_list_row_labels[row], buf);
+            lv_bar_set_value(g_list_row_bars[row], 0, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(g_list_row_bars[row],
+                                      lv_color_hex(0x444444), LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(g_list_rows[row],
+                                      lv_color_hex(highlighted ? 0x244878
+                                                               : 0x0E2440),
+                                      0);
+            continue;
+        }
+        const Detection& d = snap[j];
+        const char* type = radioIcon(d.radio);
+        const char* flag = (d.vendor || d.name_hit) ? LV_SYMBOL_EYE_OPEN
+                                                    : " ";
         const char* short_name = d.name[0] ? d.name : tail;
-        // Trim long names to 14 chars to leave room for RSSI on a 172px LCD.
         char shown[15];
         size_t k = 0;
         for (; short_name[k] && k < sizeof(shown) - 1; k++) shown[k] = short_name[k];
         shown[k] = '\0';
-        snprintf(buf, sizeof(buf), "%c%s %s %d", flag, type, shown,
+        snprintf(buf, sizeof(buf), "%s%s %s %d", flag, type, shown,
                  d.rssi_smoothed);
         lv_label_set_text(g_list_row_labels[row], buf);
         lv_bar_set_value(g_list_row_bars[row], rssiBarPercent(d.rssi_smoothed),
                          LV_ANIM_OFF);
-        // Color the mini-bar fill to match this row's band — no hysteresis
-        // for per-row display, so we pass a neutral previous band.
         const Band row_band = rssiToBand(d.rssi_smoothed, BAND_OUT_OF_RANGE);
         lv_obj_set_style_bg_color(g_list_row_bars[row],
                                   lv_color_hex(bandLcdColor(row_band)),
@@ -997,8 +1269,8 @@ void uiTick(lv_timer_t* /*t*/) {
     static Detection snap[kMaxDetections];
     const int n = snapshotFresh(snap);
 
-    handleButton(snap, n);
-
+    // pickActive uses the FRESH RSSI-sorted order to find the strongest /
+    // locked device for the LED. Must run before we stabilise the list.
     const Detection* active = pickActive(snap, n);
 
     // LED reflects the active detection (lock or auto-strongest-flagged).
@@ -1012,10 +1284,26 @@ void uiTick(lv_timer_t* /*t*/) {
         applyBandToLed(BAND_OUT_OF_RANGE, now);
     }
 
+    // Stabilise the row order in List mode so the user has a steady view to
+    // navigate. Button events + rendering both see the same stable order.
+    if (g_ui_mode == UI_LIST) {
+        stabilizeListOrder(snap, n);
+    }
+
+    handleButton(snap, n);
+    logLockChangeIfAny();
+
     if (g_ui_mode == UI_HUNT) {
         renderHunt(active, n);
     } else {
-        renderList(snap, n);
+        // Throttled — only repaint List at most once per kListRenderPeriodMs
+        // so the screen stays still enough to read.
+        const uint32_t now = millis();
+        if (now - g_list_last_render_ms >= kListRenderPeriodMs ||
+            g_list_last_render_ms == 0) {
+            renderList(snap, n);
+            g_list_last_render_ms = now;
+        }
     }
 }
 
