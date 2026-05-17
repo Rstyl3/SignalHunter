@@ -1189,14 +1189,23 @@ void renderList(const Detection* snap, int n) {
     refreshListOrder(snap, n, millis());
     const int total = g_list_order_count;
 
-    // Count flagged for the title's eye-icon counter.
-    int cam_count = 0;
+    // Title shows three counter-chips:
+    //   [BT] N  [WiFi] N  [eye] N
+    // Total = BT + Wi-Fi is obvious from the sum, and dropping it leaves
+    // room for two-digit counts without clipping the 172 px header. AP and
+    // STA both count as Wi-Fi.
+    int bt_count = 0, wifi_count = 0, cam_count = 0;
     for (int i = 0; i < total; i++) {
         const int j = findInSnapshot(snap, n, g_list_order_macs[i]);
-        if (j >= 0 && (snap[j].vendor || snap[j].name_hit)) cam_count++;
+        if (j < 0) continue;
+        if (snap[j].radio == RADIO_BLE) bt_count++;
+        else                            wifi_count++;
+        if (snap[j].vendor || snap[j].name_hit) cam_count++;
     }
-    snprintf(buf, sizeof(buf), "Detections %d  " LV_SYMBOL_EYE_OPEN " %d",
-             total, cam_count);
+    snprintf(buf, sizeof(buf),
+             LV_SYMBOL_BLUETOOTH " %d  " LV_SYMBOL_WIFI " %d  "
+             LV_SYMBOL_EYE_OPEN " %d",
+             bt_count, wifi_count, cam_count);
     lv_label_set_text(g_list_title, buf);
 
     // Clamp highlight row to current list size for display.
