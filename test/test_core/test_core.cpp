@@ -284,7 +284,7 @@ static void test_button_long_and_extra_long() {
 // frame80211
 // ---------------------------------------------------------------------------
 static const uint8_t kBssid[6] = {0xAA, 0xBB, 0xCC, 0x00, 0x00, 0x01};
-static const uint8_t kSta[6]   = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+static const uint8_t kSta[6]   = {0x10, 0x22, 0x33, 0x44, 0x55, 0x66};   // unicast: bit 0 of byte 0 clear
 static const uint8_t kBcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static int header(uint8_t* f, uint8_t fc0, uint8_t fc1, const uint8_t* a1,
