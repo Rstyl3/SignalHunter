@@ -34,7 +34,7 @@ void LCD_WriteData_Word(uint16_t Data)
   digitalWrite(EXAMPLE_PIN_NUM_LCD_CS, HIGH);  
   SPI.endTransaction();
 }   
-void LCD_WriteData_nbyte(uint8_t* SetData,uint8_t* ReadData,uint32_t Size) 
+void LCD_WriteData_nbyte(const uint8_t* SetData, uint32_t Size) 
 { 
   SPI.beginTransaction(SPISettings(SPIFreq, MSBFIRST, SPI_MODE0));
   digitalWrite(EXAMPLE_PIN_NUM_LCD_CS, LOW);  
@@ -219,27 +219,22 @@ void LCD_addWindow(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yen
   uint16_t Show_Height = Yend - Ystart + 1;
   uint32_t numBytes = Show_Width * Show_Height * sizeof(uint16_t);
   LCD_SetCursor(Xstart, Ystart, Xend, Yend);
-  LCD_WriteData_nbyte((uint8_t*)color, nullptr, numBytes);        
+  LCD_WriteData_nbyte(reinterpret_cast<const uint8_t*>(color), numBytes);        
 }
 // backlight
 void Backlight_Init(void)
 {
   ledcAttach(EXAMPLE_PIN_NUM_BK_LIGHT, Frequency, Resolution);   
-  ledcWrite(EXAMPLE_PIN_NUM_BK_LIGHT, 100);                        
+  ledcWrite(EXAMPLE_PIN_NUM_BK_LIGHT, 0);   // off until the first frame is painted
 }
 
-void Set_Backlight(uint8_t Light)                        //
+void Set_Backlight(uint8_t Light)
 {
-
-  if(Light > 100 || Light < 0)
+  if (Light > 100) {
     printf("Set Backlight parameters in the range of 0 to 100 \r\n");
-  else{
-    uint32_t Backlight = Light*10;
-    ledcWrite(EXAMPLE_PIN_NUM_BK_LIGHT, Backlight);
+    return;
   }
+  // 10-bit PWM: 0..1023. 100 % maps to full scale.
+  const uint32_t duty = (static_cast<uint32_t>(Light) * 1023u) / 100u;
+  ledcWrite(EXAMPLE_PIN_NUM_BK_LIGHT, duty);
 }
-
-
-
-
-

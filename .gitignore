@@ -21,3 +21,12 @@ Thumbs.db
 *~
 *.swp
 *.bak
+
+# OUI generator download cache (IEEE registry CSVs)
+tools/.cache/
+
+# Python bytecode from running the tools/ scripts
+__pycache__/
+
+# PlatformIO writes the .ino conversion next to the sketch while building
+signalhunter/*.ino.cpp
